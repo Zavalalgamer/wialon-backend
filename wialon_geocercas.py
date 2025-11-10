@@ -1,6 +1,6 @@
 # wialon_geocercas.py
 # FastAPI para exponer unidades y geocercas de Wialon
-# listo para Render
+# listo para Render + endpoint /wialon/snapshot
 
 import os
 import time
@@ -27,7 +27,7 @@ SESSION_TS: float = 0
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
-app = FastAPI(title="Wialon Backend", version="1.0.0")
+app = FastAPI(title="Wialon Backend", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,10 +42,7 @@ app.add_middleware(
 # Helpers de autenticación
 # ------------------------------------------------------------
 def _login_with_token(token: str) -> str:
-    """
-    Intenta loguearse con token/login.
-    Si Wialon responde mal, lanzamos excepción.
-    """
+    """Intenta loguearse con token/login."""
     r = requests.get(
         WIALON_BASE,
         params={
@@ -55,12 +52,11 @@ def _login_with_token(token: str) -> str:
         timeout=20,
     )
     if not r.ok:
-        raise HTTPException(status_code=502, detail=f"token/login HTTP {r.status_code}")
+      raise HTTPException(status_code=502, detail=f"token/login HTTP {r.status_code}")
 
     data = r.json()
     sid = data.get("eid") or data.get("sid")
     if not sid:
-        # Wialon a veces responde {"error":4} cuando el token no es de ese tipo
         raise HTTPException(status_code=400, detail=f"token/login falló: {data}")
     return sid
 
@@ -168,6 +164,7 @@ def root():
             "/wialon/resources",
             "/wialon/resources/{resource_id}/geofences",
             "/wialon/units/in-geofences/local",
+            "/wialon/snapshot?resource_id=18891825",
         ],
     }
 
@@ -360,3 +357,27 @@ def cross_units_local():
                 result[str(rid)][str(u["id"])] = hits
 
     return {"ok": True, "result": result}
+
+
+# ------------------------------------------------------------
+# /wialon/snapshot
+# pensado para el frontend rápido: trae todo de una
+# ------------------------------------------------------------
+@app.get("/wialon/snapshot", summary="Unidades + recursos + geocercas de un recurso")
+def snapshot(resource_id: int):
+    """
+    Devuelve:
+      - units: todas las unidades (con lat/lon)
+      - resources: todos los recursos
+      - geofences_by_resource: solo del recurso pedido (interpretadas)
+    Así el frontend ya no tiene que pegarle 3 veces.
+    """
+    units = list_units()["units"]
+    resources = list_resources()["resources"]
+    geos = geofences_of_resource(resource_id)["geofences"]
+    return {
+        "ok": True,
+        "units": units,
+        "resources": resources,
+        "geofences_by_resource": {str(resource_id): geos},
+    }
