@@ -1,6 +1,6 @@
 # wialon_geocercas.py
 # FastAPI para exponer unidades y geocercas de Wialon
-# listo para Render + endpoint /wialon/snapshot
+# versión ligera para Render: el cruce acepta resource_id y límite
 
 import os
 import time
@@ -8,41 +8,39 @@ import json
 from typing import Optional, Dict, Any, List
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------
-# Cargar .env (local); en Render usa las env del dashboard
+# .env (local) / variables de entorno (Render)
 # ------------------------------------------------------------
 load_dotenv()
 
 WIALON_BASE = os.getenv("WIALON_BASE", "https://hst-api.wialon.com/wialon/ajax.html")
 WIALON_TOKEN = os.getenv("WIALON_TOKEN", "")
 
-# cache de sesión
 SESSION_SID: Optional[str] = None
 SESSION_TS: float = 0
 
 # ------------------------------------------------------------
-# App
+# FastAPI
 # ------------------------------------------------------------
 app = FastAPI(title="Wialon Backend", version="1.1.0")
 
+# CORS abierto para que Vercel pueda llamar
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # si quieres más estricto, cámbialo
+    allow_origins=["*"],          # si quieres, aquí pones tu dominio de vercel
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # ------------------------------------------------------------
-# Helpers de autenticación
+# helpers de sesión
 # ------------------------------------------------------------
 def _login_with_token(token: str) -> str:
-    """Intenta loguearse con token/login."""
     r = requests.get(
         WIALON_BASE,
         params={
@@ -52,8 +50,7 @@ def _login_with_token(token: str) -> str:
         timeout=20,
     )
     if not r.ok:
-      raise HTTPException(status_code=502, detail=f"token/login HTTP {r.status_code}")
-
+        raise HTTPException(status_code=502, detail=f"token/login HTTP {r.status_code}")
     data = r.json()
     sid = data.get("eid") or data.get("sid")
     if not sid:
@@ -62,29 +59,21 @@ def _login_with_token(token: str) -> str:
 
 
 def _ensure_sid() -> str:
-    """
-    Devuelve un SID válido.
-    1) usa cache
-    2) intenta token/login
-    3) si eso falla por WRONG_PARAMS, asumimos que WIALON_TOKEN ya es un SID
-    """
     global SESSION_SID, SESSION_TS
-
     if not WIALON_TOKEN:
         raise HTTPException(status_code=400, detail="Falta WIALON_TOKEN en entorno")
 
-    # usa cache 4 min
+    # usa cache 4 minutos
     if SESSION_SID and (time.time() - SESSION_TS) < 240:
         return SESSION_SID
 
-    # reintenta login
     try:
         sid = _login_with_token(WIALON_TOKEN)
         SESSION_SID = sid
         SESSION_TS = time.time()
         return sid
     except HTTPException as e:
-        # si el token no era de API sino un SID directo:
+        # si el token en realidad ya es un sid
         if "WRONG_PARAMS" in str(e.detail) or "invalid token" in str(e.detail).lower():
             SESSION_SID = WIALON_TOKEN
             SESSION_TS = time.time()
@@ -93,9 +82,6 @@ def _ensure_sid() -> str:
 
 
 def wialon_call(svc: str, params: Dict[str, Any]) -> Any:
-    """
-    Llama a Wialon con un SID válido. Si expira, reintenta una vez.
-    """
     sid = _ensure_sid()
     r = requests.get(
         WIALON_BASE,
@@ -106,9 +92,8 @@ def wialon_call(svc: str, params: Dict[str, Any]) -> Any:
         raise HTTPException(status_code=502, detail=f"Wialon HTTP {r.status_code}: {r.text}")
 
     data = r.json()
-    # errores típicos de sesión
+    # errores de sesión → reintenta una vez
     if isinstance(data, dict) and data.get("error") in (1, 2, 3, 4, 5, 8):
-        # limpiar cache y reintentar
         global SESSION_SID
         SESSION_SID = None
         sid = _ensure_sid()
@@ -124,7 +109,7 @@ def wialon_call(svc: str, params: Dict[str, Any]) -> Any:
 
 
 # ------------------------------------------------------------
-# Utils geométricos
+# utilidades de geometría
 # ------------------------------------------------------------
 def _point_in_polygon(lat: float, lon: float, ring: List[Dict[str, float]]) -> bool:
     inside = False
@@ -144,27 +129,24 @@ def _point_in_polygon(lat: float, lon: float, ring: List[Dict[str, float]]) -> b
 
 
 def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    # aproximación rápida (no haversine exacta pero suficiente)
     dy = (lat2 - lat1) * 111_000
     dx = (lon2 - lon1) * 111_000
     return (dx * dx + dy * dy) ** 0.5
 
 
 # ------------------------------------------------------------
-# Endpoints básicos
+# endpoints base
 # ------------------------------------------------------------
-@app.get("/", summary="Endpoints disponibles")
+@app.get("/")
 def root():
     return {
         "ok": True,
         "endpoints": [
             "/health",
-            "/debug/routes",
             "/wialon/units",
             "/wialon/resources",
-            "/wialon/resources/{resource_id}/geofences",
-            "/wialon/units/in-geofences/local",
-            "/wialon/snapshot?resource_id=18891825",
+            "/wialon/resources/{id}/geofences",
+            "/wialon/units/in-geofences/local?resource_id=...&max_units=...",
         ],
     }
 
@@ -174,13 +156,8 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/debug/routes")
-def debug_routes():
-    return {"routes": [r.path for r in app.routes]}
-
-
 # ------------------------------------------------------------
-# /wialon/units
+# unidades / recursos
 # ------------------------------------------------------------
 @app.get("/wialon/units", summary="Lista de unidades")
 def list_units():
@@ -194,7 +171,7 @@ def list_units():
                 "sortType": "sys_name",
             },
             "force": 1,
-            "flags": 1025,  # incluye pos
+            "flags": 1025,
             "from": 0,
             "to": 0,
         },
@@ -215,9 +192,6 @@ def list_units():
     return {"count": len(out), "units": out}
 
 
-# ------------------------------------------------------------
-# /wialon/resources
-# ------------------------------------------------------------
 @app.get("/wialon/resources", summary="Lista de recursos")
 def list_resources():
     data = wialon_call(
@@ -236,25 +210,16 @@ def list_resources():
         },
     )
     items = data.get("items", [])
-    return {
-        "count": len(items),
-        "resources": [{"id": r["id"], "name": r["nm"]} for r in items],
-    }
+    return {"count": len(items), "resources": [{"id": r["id"], "name": r["nm"]} for r in items]}
 
 
 # ------------------------------------------------------------
-# /wialon/resources/{id}/geofences
-# interpreta el formato nativo de Wialon
+# geocercas por recurso
 # ------------------------------------------------------------
-@app.get(
-    "/wialon/resources/{resource_id}/geofences",
-    summary="Geocercas del recurso (polígonos y círculos)",
-)
+@app.get("/wialon/resources/{resource_id}/geofences", summary="Geocercas del recurso")
 def geofences_of_resource(resource_id: int):
-    # resource/get_zone_data con flags "grandes"
     raw = wialon_call("resource/get_zone_data", {"itemId": resource_id, "flags": 0x1F})
     iterable = raw.values() if isinstance(raw, dict) else (raw or [])
-
     zones = []
     for z in iterable:
         name = z.get("n") or z.get("name") or ""
@@ -269,24 +234,21 @@ def geofences_of_resource(resource_id: int):
             "radius": None,
         }
 
-        # 1) polígono
+        # polígono
         if jp.get("points"):
-            # ya viene como [{lat,lon},...]
             item["points"] = [
                 {"lat": float(p["lat"]), "lon": float(p["lon"])} for p in jp["points"]
             ]
         elif z.get("p"):
-            norm = []
+            pts = []
             for p in z["p"]:
-                # p puede venir como dict {x,y}
                 if isinstance(p, dict):
-                    norm.append({"lat": float(p["y"]), "lon": float(p["x"])})
+                    pts.append({"lat": float(p["y"]), "lon": float(p["x"])})
                 else:
-                    # o como [x,y]
-                    norm.append({"lat": float(p[1]), "lon": float(p[0])})
-            item["points"] = norm
+                    pts.append({"lat": float(p[1]), "lon": float(p[0])})
+            item["points"] = pts
 
-        # 2) círculo
+        # círculo
         if jp.get("center") and jp.get("radius"):
             c = jp["center"]
             item["center"] = {"lat": float(c["lat"]), "lon": float(c["lon"])}
@@ -302,36 +264,33 @@ def geofences_of_resource(resource_id: int):
 
 
 # ------------------------------------------------------------
-# /wialon/units/in-geofences/local
-# cruza todas las unidades con todas las geocercas que haya en todos los recursos
+# cruce local (ligero)
 # ------------------------------------------------------------
 @app.get(
     "/wialon/units/in-geofences/local",
-    summary="Cruce local: qué unidades están dentro de qué geocercas",
+    summary="Cruce local limitado (para Render)",
 )
-def cross_units_local():
+def cross_units_local(
+    resource_id: Optional[int] = Query(None, description="ID de recurso wialon (recomendado)"),
+    max_units: int = Query(200, description="máximo de unidades a considerar"),
+):
     # 1) unidades
     units_resp = list_units()
-    units = units_resp["units"]
+    units = units_resp["units"][:max_units]
 
     # 2) recursos
-    resources_resp = list_resources()
-    resources = resources_resp["resources"]
+    if resource_id is not None:
+      resources = [{"id": resource_id, "name": ""}]
+    else:
+      resources = list_resources()["resources"]
 
-    # 3) traer geocercas de cada recurso
-    resource_geos: Dict[int, List[Dict[str, Any]]] = {}
+    result: Dict[str, Dict[str, List[int]]] = {}
+
     for r in resources:
         rid = r["id"]
         geos = geofences_of_resource(rid)["geofences"]
-        resource_geos[rid] = geos
-
-    # 4) por cada unidad, probar contra todas las geocercas del recurso correspondiente
-    result: Dict[str, Dict[str, List[int]]] = {}  # {resource_id: {unit_id: [zone_id,...]}}
-
-    for r in resources:
-        rid = r["id"]
-        geos = resource_geos.get(rid, [])
         result[str(rid)] = {}
+
         for u in units:
             lat = u.get("lat")
             lon = u.get("lon")
@@ -340,12 +299,10 @@ def cross_units_local():
 
             hits: List[int] = []
             for g in geos:
-                # polígono
                 if g.get("points"):
                     if _point_in_polygon(lat, lon, g["points"]):
                         hits.append(int(g["id"]))
                         continue
-                # círculo
                 if g.get("center") and g.get("radius"):
                     c = g["center"]
                     d = _dist_m(lat, lon, c["lat"], c["lon"])
@@ -357,27 +314,3 @@ def cross_units_local():
                 result[str(rid)][str(u["id"])] = hits
 
     return {"ok": True, "result": result}
-
-
-# ------------------------------------------------------------
-# /wialon/snapshot
-# pensado para el frontend rápido: trae todo de una
-# ------------------------------------------------------------
-@app.get("/wialon/snapshot", summary="Unidades + recursos + geocercas de un recurso")
-def snapshot(resource_id: int):
-    """
-    Devuelve:
-      - units: todas las unidades (con lat/lon)
-      - resources: todos los recursos
-      - geofences_by_resource: solo del recurso pedido (interpretadas)
-    Así el frontend ya no tiene que pegarle 3 veces.
-    """
-    units = list_units()["units"]
-    resources = list_resources()["resources"]
-    geos = geofences_of_resource(resource_id)["geofences"]
-    return {
-        "ok": True,
-        "units": units,
-        "resources": resources,
-        "geofences_by_resource": {str(resource_id): geos},
-    }
