@@ -1,10 +1,11 @@
 # wialon_geocercas.py
 # FastAPI para exponer unidades y geocercas de Wialon
-# versión ligera para Render: el cruce acepta resource_id y límite
+# versión optimizada para Render: cruce limitado por resource_id y max_units
 
 import os
 import time
 import json
+import logging
 from typing import Optional, Dict, Any, List
 
 import requests
@@ -23,10 +24,14 @@ WIALON_TOKEN = os.getenv("WIALON_TOKEN", "")
 SESSION_SID: Optional[str] = None
 SESSION_TS: float = 0
 
+# logger simple
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("wialon")
+
 # ------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------
-app = FastAPI(title="Wialon Backend", version="1.1.0")
+app = FastAPI(title="Wialon Backend", version="1.2.0")
 
 # CORS abierto para que Vercel pueda llamar
 app.add_middleware(
@@ -142,11 +147,10 @@ def root():
     return {
         "ok": True,
         "endpoints": [
-            "/health",
             "/wialon/units",
             "/wialon/resources",
-            "/wialon/resources/{id}/geofences",
-            "/wialon/units/in-geofences/local?resource_id=...&max_units=...",
+            "/wialon/resources/{resource_id}/geofences",
+            "/wialon/units/in-geofences/local",
         ],
     }
 
@@ -160,7 +164,13 @@ def health():
 # unidades / recursos
 # ------------------------------------------------------------
 @app.get("/wialon/units", summary="Lista de unidades")
-def list_units():
+def list_units(limit: int = 200):
+    """
+    Devuelve hasta `limit` unidades.
+    También se usa internamente desde el cruce local.
+    """
+    to = max(limit - 1, 0)
+
     data = wialon_call(
         "core/search_items",
         {
@@ -173,7 +183,7 @@ def list_units():
             "force": 1,
             "flags": 1025,
             "from": 0,
-            "to": 0,
+            "to": to,
         },
     )
     out = []
@@ -264,32 +274,35 @@ def geofences_of_resource(resource_id: int):
 
 
 # ------------------------------------------------------------
-# cruce local (ligero)
+# cruce local (ligero / optimizado)
 # ------------------------------------------------------------
 @app.get(
     "/wialon/units/in-geofences/local",
     summary="Cruce local limitado (para Render)",
 )
 def cross_units_local(
-    resource_id: Optional[int] = Query(None, description="ID de recurso wialon (recomendado)"),
-    max_units: int = Query(200, description="máximo de unidades a considerar"),
+    resource_id: int = Query(..., description="ID de recurso wialon (obligatorio)"),
+    max_units: int = Query(50, ge=1, le=100, description="máximo de unidades a considerar"),
 ):
-    # 1) unidades
-    units_resp = list_units()
-    units = units_resp["units"][:max_units]
+    """
+    Cruce local entre hasta `max_units` unidades y TODAS las geocercas
+    del recurso indicado. Pensado para ejecutarse rápido en Render.
+    """
+    t0 = time.time()
+    logger.info(f"Inicio cruce local resource_id={resource_id}, max_units={max_units}")
 
-    # 2) recursos
-    if resource_id is not None:
-      resources = [{"id": resource_id, "name": ""}]
-    else:
-      resources = list_resources()["resources"]
+    try:
+        # 1) unidades (limitadas desde Wialon)
+        units_resp = list_units(limit=max_units)
+        units = units_resp["units"]
+        logger.info(f"Unidades cargadas: {len(units)} en {time.time() - t0:.1f}s")
 
-    result: Dict[str, Dict[str, List[int]]] = {}
+        # 2) geocercas del recurso
+        geos_resp = geofences_of_resource(resource_id)
+        geos = geos_resp["geofences"]
+        logger.info(f"Geocercas cargadas: {len(geos)} en {time.time() - t0:.1f}s")
 
-    for r in resources:
-        rid = r["id"]
-        geos = geofences_of_resource(rid)["geofences"]
-        result[str(rid)] = {}
+        result: Dict[str, Dict[str, List[int]]] = {str(resource_id): {}}
 
         for u in units:
             lat = u.get("lat")
@@ -299,10 +312,12 @@ def cross_units_local(
 
             hits: List[int] = []
             for g in geos:
+                # polígono
                 if g.get("points"):
                     if _point_in_polygon(lat, lon, g["points"]):
                         hits.append(int(g["id"]))
                         continue
+                # círculo
                 if g.get("center") and g.get("radius"):
                     c = g["center"]
                     d = _dist_m(lat, lon, c["lat"], c["lon"])
@@ -311,6 +326,16 @@ def cross_units_local(
                         continue
 
             if hits:
-                result[str(rid)][str(u["id"])] = hits
+                result[str(resource_id)][str(u["id"])] = hits
 
-    return {"ok": True, "result": result}
+        elapsed = time.time() - t0
+        logger.info(f"Cruce terminado en {elapsed:.1f}s")
+
+        return {"ok": True, "result": result, "elapsed_s": round(elapsed, 2)}
+
+    except HTTPException:
+        # re-lanzar HTTPException tal cual
+        raise
+    except Exception as e:
+        logger.exception("Error interno en cruce local")
+        raise HTTPException(status_code=500, detail=f"Error interno en cruce local: {e}")
